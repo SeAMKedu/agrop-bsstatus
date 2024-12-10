@@ -23,27 +23,23 @@ class StatusPoller():
         self.config = configparser.ConfigParser()
         self.config.read(ini_file)
 
-        influx_host = self.config['INFLUXDB']['Host']
-        influx_token = self.config['INFLUXDB']['Token']
-        influx_org = self.config['INFLUXDB']['Org']
-        influx_bucket = self.config['INFLUXDB']['Bucket']
-
-        client = InfluxDBClient(url=influx_host, token=influx_token, org=influx_org)
-
-        write_api = client.write_api(write_options=SYNCHRONOUS)
+        # make connection to influxdb
+        write_api = self.influxdb_connection()
 
         try:
+            # collect data from different endpoints
             p = Point("status")
-            self.collect_systemdata(p)
-            self.collect_sensordata(p)
+            self.collect_systemdata(p)  # cpu temp from /sys
+            self.collect_sensordata(p)  # read selected onewire temperature sensors
             
             gpsd_host = self.config['GPSD']["Host"]
-            gpsd_port = int(self.config['GPSD']["Port"])
+            gpsd_port = int(self.config['GPSD']["Port"])    
+            influx_bucket = self.config['INFLUXDB']['Bucket']
 
-            polled = self.poll_gpsd(gpsd_host, gpsd_port)
-            parsed = self.parse_poll(polled)
-            self.collect_gpsddata(parsed, p)
-            self.collect_satellitedata(parsed, influx_bucket, write_api)
+            polled = self.poll_gpsd(gpsd_host, gpsd_port)   # get data from from gpsd
+            parsed = self.parse_poll(polled)                # parse data from gpsd
+            self.collect_gpsddata(parsed, p)                # add gpsd data to same influxdb point 
+            self.collect_satellitedata(parsed, influx_bucket, write_api)    # add satellite data separately to influxdb
         except Exception as e:
             traceback.print_exc()
         finally:
@@ -52,57 +48,23 @@ class StatusPoller():
         write_api.close()
 
 
-    def collect_gpsddata(self, parsed, p):
-        mode = parsed["mode"];
-        p.field("mode", mode)
+    def influxdb_connection(self):
+        """ Open connection to influxDB server and return write_api """
+        influx_host = self.config['INFLUXDB']['Host']
+        influx_token = self.config['INFLUXDB']['Token']
+        influx_org = self.config['INFLUXDB']['Org']
 
-        if mode >= 2:
-            p.field("lat", parsed["lat"])
-            p.field("lon", parsed["lon"])
-            p.field("satellites", parsed["sat_count_total"])
-            p.field("sats_used", parsed["sat_count_used"])
-            p.field("sats_ignored", parsed["sat_count_ignored"])
-            p.field("error_lon", parsed["epx"])
-            p.field("error_lat", parsed["epy"])
-        if mode >= 3:
-            p.field("alt", parsed["alt"])
-            p.field("error_vertical", parsed["epv"])
-
-
-    def collect_satellitedata(self, parsed, bucket, write_api):
-        ts = int(dateutil.parser.parse(parsed["time"]).timestamp()) * 1000000000
-            
-        for sat in parsed["satellites"]:
-            p2 = Point("satellite")
-            p2.tag("sat", f'{sat["constellation"]}{sat["svid"]}')
-            p2.tag("gnssid", sat["gnssid"])
-            p2.tag("co", sat["constellation"])
-            p2.field("el", sat["el"])
-            p2.field("az", sat["az"])
-            p2.field("ss", sat["ss"])
-            p2.field("PRN", sat["PRN"])
-            p2.field("svid", sat["svid"])
-            p2.time(ts)
-
-            write_api.write(record=p2, bucket=bucket)
+        client = InfluxDBClient(url=influx_host, token=influx_token, org=influx_org)
+        
+        return client.write_api(write_options=SYNCHRONOUS)
 
 
     def collect_systemdata(self, p):
+        """ Collect data about system we run on """
+
+        # only CPU temp for now
         cput = self.check_CPU_temp()
         p.field("cpu_temp", round(cput, 2))
-
-
-    def collect_sensordata(self, p):
-        w1_sensors = {}
-
-        for sensorid in self.config["ONEWIRE"]:
-            realid = sensorid[3:]
-            w1_sensors[realid] = self.config["ONEWIRE"][sensorid]
-
-        for sensor in W1ThermSensor.get_available_sensors():
-            if sensor.id in w1_sensors:
-                #print("Sensor %s has temperature %.2f" % (sensor.id, sensor.get_temperature()))    
-                p.field(f"{w1_sensors[sensor.id]}_temp", round(sensor.get_temperature(), 2))
 
 
     def check_CPU_temp(self):
@@ -113,7 +75,23 @@ class StatusPoller():
         return temp
 
 
-    def poll_gpsd(self, host, port):        
+    def collect_sensordata(self, p):
+        w1_sensors = {}
+
+        # the ini file has sensorids prefixed with id_, we strip that
+        # off and add them to a dict with name we want to use in influxdb
+        for sensorid in self.config["ONEWIRE"]:
+            realid = sensorid[3:]
+            w1_sensors[realid] = self.config["ONEWIRE"][sensorid]
+
+        for sensor in W1ThermSensor.get_available_sensors():
+            if sensor.id in w1_sensors:
+                #print("Sensor %s has temperature %.2f" % (sensor.id, sensor.get_temperature()))    
+                p.field(f"{w1_sensors[sensor.id]}_temp", round(sensor.get_temperature(), 2))
+
+
+    def poll_gpsd(self, host, port):
+        """ Poll the GPSD server via socket connection."""
         polled = {}
         gpsd = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 
@@ -141,7 +119,7 @@ class StatusPoller():
             gpsd.sendall(MSG_WATCH_DISABLE.encode())
             data = gpsd.recv(1024)
         except Exception as e:
-            print(e)
+            traceback.print_exc()
         finally:
             gpsd.close()
 
@@ -157,6 +135,7 @@ class StatusPoller():
                 print(f"{indent * '  '} {key}: {value}")
 
     def parse_poll(self, polled):
+        """ Parse gpsd reponse into something more manageable """
         parsed = {}
         parsed["satellites"] = []
         parsed["sat_count_used"] = 0
@@ -206,7 +185,51 @@ class StatusPoller():
         return parsed
 
 
+    def collect_gpsddata(self, parsed, p):
+        """ Put parsed gpsd data into datapoint """
+        
+        mode = parsed["mode"];
+        p.field("mode", mode)
+
+        if mode >= 2:
+            # add data available on 2d fix
+            p.field("lat", parsed["lat"])
+            p.field("lon", parsed["lon"])
+            p.field("satellites", parsed["sat_count_total"])
+            p.field("sats_used", parsed["sat_count_used"])
+            p.field("sats_ignored", parsed["sat_count_ignored"])
+            p.field("error_lon", parsed["epx"])
+            p.field("error_lat", parsed["epy"])
+        if mode >= 3:
+            # add data available on 3d fix
+            p.field("alt", parsed["alt"])
+            p.field("error_vertical", parsed["epv"])
+
+
+    def collect_satellitedata(self, parsed, bucket, write_api):
+        """ Add satellinte data to datapoint and write to influxdb """ 
+
+        # same timestamp for all
+        ts = int(dateutil.parser.parse(parsed["time"]).timestamp()) * 1000000000
+            
+        for sat in parsed["satellites"]:
+            # add datapoint for each visible satellite
+            p2 = Point("satellite")
+            p2.tag("sat", f'{sat["constellation"]}{sat["svid"]}')
+            p2.tag("gnssid", sat["gnssid"])
+            p2.tag("co", sat["constellation"])
+            p2.field("el", sat["el"])
+            p2.field("az", sat["az"])
+            p2.field("ss", sat["ss"])
+            p2.field("PRN", sat["PRN"])
+            p2.field("svid", sat["svid"])
+            p2.time(ts)
+
+            write_api.write(record=p2, bucket=bucket)
+
+
 if __name__ == "__main__":
+    # parse command line arguments
     parser = argparse.ArgumentParser(description='GPSD status poller')
     parser.add_argument('ini_file', type=str, help='Path to the INI file')
     args = parser.parse_args()
