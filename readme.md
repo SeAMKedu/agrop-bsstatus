@@ -6,6 +6,8 @@
 
 ![agrop_logo]
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14637274.svg)](https://doi.org/10.5281/zenodo.14637274)
+
 # Tukiaseman status
 
 ## RTK tukiasema
